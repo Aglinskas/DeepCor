@@ -1,3 +1,3 @@
 # Code for generating data for simple simulation and DeepCor training. 
  - **simple_simulation_data_generation.py** # Main file to generate simple simulation datasets
- - **training_simple_simulation.ipynb** # Main file to train the DeepCor model
+ - **training_simple_simulation.py** # Main file to train the DeepCor model
