@@ -1,98 +1,136 @@
-import argparse
-from training_realistic_simulation import train_deepcor, train_compcor
-from utils import TrainDataset
+from models import cVAE
+from utils import r_squared_list, EarlyStopper, Scaler
 import torch
+import torch.optim as optim 
 import numpy as np
-import random
-import os
-from torch.utils.data import random_split
-from numpy import savetxt
+from sklearn.decomposition import PCA
+from sklearn import linear_model
 
-def set_seed(seed: int = 42) -> None:
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # When running on the CuDNN backend, two further options must be set
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # Set a fixed value for the hash seed
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    print(f"Random seed set as {seed}")
+def train_deepcor(latent_dim, train_in, val_in, test_in, in_dim):
+    model = cVAE(in_channels=1, in_dim=in_dim, latent_dim=latent_dim, hidden_dims=[64, 128, 256, 256])
+    optimizer = optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--num-length', type=int, default=156)
-    parser.add_argument('--percent-obs', type=float, default=1.0)
-    parser.add_argument('--savedir', type=str, default='./')
-    parser.add_argument('--is-linear', type=bool, default=True)
-    parser.add_argument('--std', type=float, default=1.0)
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--latent-dim', type=int, default=8)
-    parser.add_argument('--num-pcs', type=int, default=5)
-    args = parser.parse_args()
 
-    set_seed(args.seed)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    epoch_num = 200
+    train_loss_L = []
+    train_recons_L = []
+    train_KLD_L = []
+    val_loss_L = []
+    val_recons_L = []
+    val_KLD_L = []
+    test_correlation_L = []
+    test_loss_n_L = []
+    test_percentile_L = []
+    early_stopper = EarlyStopper(patience=10, min_delta=0.001)
 
-    args.savedir = f'{args.savedir}percent-obs_{args.percent_obs}_num-length_{args.num_length}'
-    if not os.path.exists(args.savedir):
-        os.makedirs(args.savedir)
+    for epoch in range(epoch_num):  # loop over the dataset multiple times
+        print('Epoch {}/{}'.format(epoch, epoch_num-1))
+        print('-' * 10)
 
-    # load the dataset
-    data_path = '/mmfs1/data/zhupu/Revision/datasets/realistic_simulation/'
-    gt_list = np.loadtxt(f'{data_path}gt_list.csv', delimiter=",", dtype=float)
-    obs_list = np.loadtxt(f'{data_path}obs_list.csv', delimiter=",", dtype=float)
-    noi_list = np.loadtxt(f'{data_path}noi_list.csv', delimiter=",", dtype=float)
+        train_loss = 0.0
+        train_reconstruction_loss = 0.0
+        train_KLD = 0.0
+        val_loss = 0.0
+        val_reconstruction_loss = 0.0
+        val_KLD = 0.0
 
-    # initiate dataset in pytorch (and crop as needed)
-    if args.num_length != 156:
-        cropped_gt_list = gt_list[:, 0:args.num_length]
-        cropped_obs_list = obs_list[:, 0:args.num_length]
-        cropped_noi_list = noi_list[:, 0:args.num_length]
-        inputs_all = TrainDataset(cropped_obs_list, cropped_gt_list, cropped_noi_list)
-        in_dim = cropped_gt_list.shape[1]
-        print("Time course length is "+str(cropped_gt_list.shape[1]))
-    else:
-        inputs_all = TrainDataset(obs_list, gt_list, noi_list)
-        in_dim = gt_list.shape[1]
-        print("Time course length is "+str(gt_list.shape[1]))
+        # Iterate over data.
+        dataloader_iter_in = iter(train_in)
+        for i in range(len(train_in)):
+            inputs_gm,inputs_gt,inputs_cf = next(dataloader_iter_in)
 
-    # Randomly select certain amounts of samples
-    train_num = int(args.percent_obs*0.70*obs_list.shape[0])
-    val_num = int(0.15*obs_list.shape[0])
-    test_num = int(0.15*obs_list.shape[0])
-    total_num_samples = val_num + test_num + train_num
-    selected_indices = np.random.choice(len(inputs_all), size=total_num_samples, replace=False)
-    selected_samples = torch.utils.data.Subset(inputs_all, selected_indices)
+            inputs_gm = inputs_gm.unsqueeze(1).float().to(device)
+            inputs_cf = inputs_cf.unsqueeze(1).float().to(device)
+            # zero the parameter gradients
+            optimizer.zero_grad()
+            # encoder + decoder
+            [outputs_gm, inputs_gm, tg_mu_z, tg_log_var_z, tg_mu_s, tg_log_var_s,tg_z,tg_x] = model.forward_tg(inputs_gm)
+            [outputs_cf, inputs_cf, bg_mu_s, bg_log_var_s] = model.forward_bg(inputs_cf)
+            outputs = torch.concat((outputs_gm,outputs_cf),1)
+            loss = model.loss_function(outputs_gm, inputs_gm, tg_mu_z, tg_log_var_z, tg_mu_s, tg_log_var_s,tg_z,tg_x, outputs_cf, inputs_cf, bg_mu_s, bg_log_var_s)
+            # backward + optimize
+            loss['loss'].backward()
+            optimizer.step()
+            # print statistics
+            train_loss += loss['loss']
+            train_reconstruction_loss += loss['Reconstruction_Loss']
+            train_KLD += loss['KLD']
+        # validation
+        with torch.no_grad():
+            val_gm, val_gt, val_cf = next(iter(val_in))
+            val_gm = val_gm.unsqueeze(1).float().to(device)
+            val_cf = val_cf.unsqueeze(1).float().to(device)
+            [outputs_gm, inputs_gm, tg_mu_z, tg_log_var_z, tg_mu_s, tg_log_var_s,tg_z,tg_x] = model.forward_tg(val_gm)
+            [outputs_cf, inputs_cf, bg_mu_s, bg_log_var_s] = model.forward_bg(val_cf)
+            loss_val = model.loss_function(outputs_gm, inputs_gm, tg_mu_z, tg_log_var_z, tg_mu_s, tg_log_var_s,tg_z,tg_x, outputs_cf, inputs_cf, bg_mu_s, bg_log_var_s)
+            if early_stopper.early_stop(loss_val['loss']):
+                break
 
-    generator = torch.Generator().manual_seed(args.seed)
-    train_inputs, val_inputs, test_inputs = random_split(selected_samples, [train_num, val_num, test_num], generator=generator)
-    print("Train number is "+str(len(train_inputs)))
-    print("Val number is "+str(len(val_inputs)))
-    print("Test number is "+str(len(test_inputs)))
+        epoch_train_loss = train_loss / (len(train_in)*2)
+        epoch_train_reconstruction_loss = train_reconstruction_loss / (len(train_in)*2)
+        epoch_train_KLD = train_KLD / (len(train_in)*2)
+        epoch_val_loss = loss_val['loss']
+        epoch_val_reconstruction_loss= loss_val['Reconstruction_Loss']
+        epoch_val_KLD = loss_val['KLD']
+        print('Training Loss: {:.4f} Training Reconstruction Loss: {:.4f} Training KLD {:.4f}'.format(epoch_train_loss, epoch_train_reconstruction_loss, epoch_train_KLD))
+        print('Val Loss: {:.4f} Val Reconstruction Loss: {:.4f} Val KLD {:.4f})'.format(epoch_val_loss,epoch_val_reconstruction_loss,epoch_val_KLD))
+        print('')
+        print()
+        train_loss_L.append(epoch_train_loss)
+        train_recons_L.append(epoch_train_reconstruction_loss)
+        train_KLD_L.append(epoch_train_KLD)
+        val_loss_L.append(epoch_val_loss)
+        val_recons_L.append(epoch_val_reconstruction_loss)
+        val_KLD_L.append(epoch_val_KLD)
 
-    # dataloading
-    train_in = torch.utils.data.DataLoader(train_inputs, batch_size=args.batch_size, shuffle=True, num_workers=1)
-    val_in = torch.utils.data.DataLoader(val_inputs, batch_size=len(val_inputs), shuffle=False, num_workers=1)
-    test_in = torch.utils.data.DataLoader(test_inputs, batch_size=len(test_inputs), shuffle=False, num_workers=1)
+    print('Finished Training')
+
+    test_gm, test_gt, test_cf = next(iter(test_in))
+    test_gm = test_gm.unsqueeze(1).float().to(device)
+    test_gt = test_gt.unsqueeze(1).float().to(device)
+    test_cf = test_cf.unsqueeze(1).float().to(device)
+    [output_test, input_test, fg_mu_z, fg_log_var_z] = model.forward_fg(test_gm)
+    # loss_test = model.loss_function_val(output_test, input_test, fg_mu_z, fg_log_var_z)
+    # print('Test Loss: {:.4f} Test Reconstruction Loss: {:.4f} Test KLD {:.4f})'.format(loss_test['val_loss'],loss_test['val_recons_Loss'],loss_test['val_KLD']))
+
+    #output_test, input_test
+    output_scale = Scaler(output_test.squeeze().cpu().detach().numpy())
+    outputs_test_n = output_scale.transform(output_test.squeeze().cpu().detach().numpy())
+    test_r_squared_list = r_squared_list(test_gt.squeeze().cpu().detach().numpy(),outputs_test_n)
+    return model, test_r_squared_list
+
+def train_compcor(num_pcs, train_in, val_in, test_in):
+    dataloader_iter_in = iter(train_in)
+    train_gm,train_gt,train_cf = next(dataloader_iter_in)
+    for i in range(1,len(train_in)):
+        train_gm_new,train_gt_new,train_cf_new = next(dataloader_iter_in)
+        train_gm = np.concatenate((train_gm,train_gm_new),axis=0)
+        train_cf = np.concatenate((train_cf,train_cf_new),axis=0)
+
+    test_gm, test_gt, test_cf = next(iter(test_in))
+    test_gm = test_gm.numpy()
+    test_gt = test_gt.numpy()
+    test_cf = test_cf.numpy()
+
+    # PCA likes the time dimension as first. Let's transpose our data.
+    train_gm_t = np.transpose(train_gm)
+    train_cf_t = np.transpose(train_cf)
+    test_gm_t = np.transpose(test_gm)
+    test_cf_t = np.transpose(test_cf)
+    # Fit PCA and extract PC timecourses
+    pca = PCA(n_components = num_pcs)
+    confounds_pc = pca.fit_transform(train_cf_t)
     
-    model, test_r_squared_list = train_deepcor(args.latent_dim, train_in, val_in, test_in, in_dim)
+    # linear regression on each voxel: PCs -> voxel pattern
+    linear = linear_model.LinearRegression()
+    linear.fit(confounds_pc, test_gm_t)
 
-    test_mean = test_r_squared_list.mean()
-    test_percentile= (np.percentile(test_r_squared_list,5), np.percentile(test_r_squared_list,95))
-    # save model and loss
-    torch.save(model.state_dict(), f'{args.savedir}deepcor_model')
-    print("DeepCor testing R squared mean is "+str(test_mean))
-    print("DeepCor testing R squared percentile is "+str(test_percentile))
-    savetxt(f'{args.savedir}deepcor_r_squared_list.csv', test_r_squared_list, delimiter=',')
-    
-    compcor_r_squared_list = train_compcor(args.num_pcs, train_in, val_in, test_in)
-    compcor_test_mean = compcor_r_squared_list.mean()
-    compcor_test_percentile= (np.percentile(compcor_r_squared_list,5), np.percentile(compcor_r_squared_list,95))
-    print("CompCor testing R squared mean is "+str(compcor_test_mean))
-    print("CompCor testing R squared percentile is "+str(compcor_test_percentile))
-    savetxt(f'{args.savedir}compcor_r_squared_list.csv', compcor_r_squared_list, delimiter=',')  
+    # predict the activity of each voxel for this run
+    predict = linear.predict(confounds_pc)
+    func_denoised = test_gm_t - predict # t x v
+    func_denoised = np.transpose(func_denoised) # v x t
+    compcor_r_squared_list = r_squared_list(test_gt,func_denoised)
+    return compcor_r_squared_list
 
-if __name__ == '__main__':
-    main()
